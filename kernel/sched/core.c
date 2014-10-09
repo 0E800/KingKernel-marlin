@@ -2708,7 +2708,7 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 		put_task_struct(prev);
 	}
 
-	tick_nohz_task_switch();
+	tick_nohz_task_switch(current);
 	return rq;
 }
 
@@ -2748,8 +2748,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 
 	/* finish_task_switch() drops rq->lock and enables preemtion */
 	preempt_disable();
-	rq = this_rq();
-	finish_task_switch(rq, prev);
+	rq = finish_task_switch(prev);
 	post_schedule(rq);
 	preempt_enable();
 

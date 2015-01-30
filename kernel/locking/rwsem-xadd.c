@@ -299,15 +299,15 @@ static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
 static inline bool rwsem_can_spin_on_owner(struct rw_semaphore *sem)
 {
 	struct task_struct *owner;
-	bool on_cpu = false;
+	bool ret = true;
 
 	if (need_resched())
 		return false;
 
 	rcu_read_lock();
-	owner = READ_ONCE(sem->owner);
+	owner = ACCESS_ONCE(sem->owner);
 	if (!owner) {
-		long count = READ_ONCE(sem->count);
+		long count = ACCESS_ONCE(sem->count);
 		/*
 		 * If sem->owner is not set, yet we have just recently entered the
 		 * slowpath with the lock being active, then there is a possibility
@@ -322,13 +322,7 @@ static inline bool rwsem_can_spin_on_owner(struct rw_semaphore *sem)
 	ret = owner->on_cpu;
 done:
 	rcu_read_unlock();
-
-	/*
-	 * If sem->owner is not set, yet we have just recently entered the
-	 * slowpath, then there is a possibility reader(s) may have the lock.
-	 * To be safe, avoid spinning in these situations.
-	 */
-	return on_cpu;
+	return ret;
 }
 
 static inline bool owner_running(struct rw_semaphore *sem,

@@ -138,7 +138,15 @@ static void fixup_rt_mutex_waiters(struct rt_mutex *lock)
  * set up.
  */
 #ifndef CONFIG_DEBUG_RT_MUTEXES
-# define rt_mutex_cmpxchg(l,c,n)	(cmpxchg(&l->owner, c, n) == c)
+# define rt_mutex_cmpxchg_relaxed(l,c,n) (cmpxchg_relaxed(&l->owner, c, n) == c)
+# define rt_mutex_cmpxchg_acquire(l,c,n) (cmpxchg_acquire(&l->owner, c, n) == c)
+# define rt_mutex_cmpxchg_release(l,c,n) (cmpxchg_release(&l->owner, c, n) == c)
+
+/*
+ * Callers must hold the ->wait_lock -- which is the whole purpose as we force
+ * all future threads that attempt to [Rmw] the lock to the slowpath. As such
+ * relaxed semantics suffice.
+ */
 static inline void mark_rt_mutex_waiters(struct rt_mutex *lock)
 {
 	unsigned long owner, *p = (unsigned long *) &lock->owner;

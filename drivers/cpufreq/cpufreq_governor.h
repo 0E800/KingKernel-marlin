@@ -195,17 +195,6 @@ struct cs_dbs_tuners {
 	unsigned int down_threshold_suspended;
 	unsigned int freq_step;
 	unsigned int sleep_depth;
-};
-
-struct ex_dbs_tuners {
-	unsigned int ignore_nice_load;
-	unsigned int sampling_rate;
-	unsigned int up_threshold;
-	unsigned int down_differential;
-	unsigned int active_floor_freq;
-	unsigned int sampling_down_factor;
-	unsigned int powersave;
-};
 
 /* Common Governor data across policies */
 struct dbs_data;

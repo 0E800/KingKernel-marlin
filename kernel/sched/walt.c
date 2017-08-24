@@ -41,8 +41,8 @@ static __read_mostly unsigned int walt_io_is_busy = 0;
 
 unsigned int sysctl_sched_walt_init_task_load_pct = 15;
 
-/* true -> use PELT based load stats, false -> use window-based load stats */
-bool __read_mostly walt_disabled = false;
+/* 1 -> use PELT based load stats, 0 -> use window-based load stats */
+unsigned int __read_mostly walt_disabled = 0;
 
 /*
  * Window size (in ns). Adjust for the tick size so that the window

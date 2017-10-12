@@ -2350,6 +2350,11 @@ static void post_schedule_rt(struct rq *rq)
 	push_rt_tasks(rq);
 }
 
+static void post_schedule_rt(struct rq *rq)
+{
+	push_rt_tasks(rq);
+}
+
 /*
  * If we are not running and we are not going to reschedule soon, we should
  * try to push tasks away now

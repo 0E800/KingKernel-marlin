@@ -4296,24 +4296,6 @@ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 /* requires cfs_b->lock, may release to reprogram timer */
 void __start_cfs_bandwidth(struct cfs_bandwidth *cfs_b, bool force)
 {
-	/*
-	 * The timer may be active because we're trying to set a new bandwidth
-	 * period or because we're racing with the tear-down path
-	 * (timer_active==0 becomes visible before the hrtimer call-back
-	 * terminates).  In either case we ensure that it's re-programmed
-	 */
-	while (unlikely(hrtimer_active(&cfs_b->period_timer)) &&
-	       hrtimer_try_to_cancel(&cfs_b->period_timer) < 0) {
-		/* bounce the lock to allow do_sched_cfs_period_timer to run */
-		raw_spin_unlock(&cfs_b->lock);
-		cpu_relax();
-		raw_spin_lock(&cfs_b->lock);
-		/* if someone else restarted the timer then we're done */
-		if (!force && cfs_b->timer_active)
-			return;
-	}
-
-	cfs_b->timer_active = 1;
 	start_bandwidth_timer(&cfs_b->period_timer, cfs_b->period);
 }
 

@@ -35,6 +35,7 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 
 		idle = do_sched_rt_period_timer(rt_b, overrun);
 	}
+	raw_spin_unlock(&rt_b->rt_runtime_lock);
 
 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
 }

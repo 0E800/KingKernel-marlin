@@ -488,7 +488,7 @@ void schedtune_enqueue_task(struct task_struct *p, int cpu)
 }
 
 int schedtune_allow_attach(struct cgroup_subsys_state *css,
-			   struct cgroup_taskset *tset)
+		struct cgroup_taskset *tset)
 {
 	/* We always allows tasks to be moved between existing CGroups */
 	return 0;

@@ -289,6 +289,9 @@ __read_mostly int scheduler_running;
  */
 int sysctl_sched_rt_runtime = 950000;
 
+/* cpus with isolated domains */
+cpumask_var_t cpu_isolated_map;
+
 struct rq *
 lock_rq_of(struct task_struct *p, unsigned long *flags)
 {
@@ -547,6 +550,7 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	if (cmpxchg(&node->next, NULL, WAKE_Q_TAIL))
 		return;
 
+	head->count++;
 
 	get_task_struct(task);
 
@@ -556,6 +560,10 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	*head->lastp = node;
 	head->lastp = &node->next;
 }
+
+static int
+try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
+	       int sibling_count_hint);
 
 void wake_up_q(struct wake_q_head *head)
 {
@@ -571,10 +579,10 @@ void wake_up_q(struct wake_q_head *head)
 		task->wake_q.next = NULL;
 
 		/*
-		 * wake_up_process() implies a wmb() to pair with the queueing
+		 * try_to_wake_up() implies a wmb() to pair with the queueing
 		 * in wake_q_add() so as not to miss wakeups.
 		 */
-		wake_up_process(task);
+		try_to_wake_up(task, TASK_NORMAL, 0, head->count);
 		put_task_struct(task);
 	}
 }
@@ -615,7 +623,8 @@ void resched_cpu(int cpu)
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&rq->lock, flags);
+	if (!raw_spin_trylock_irqsave(&rq->lock, flags))
+		return;
 	resched_curr(rq);
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
@@ -835,8 +844,8 @@ static void set_load_weight(struct task_struct *p)
 		return;
 	}
 
-	load->weight = scale_load(prio_to_weight[prio]);
-	load->inv_weight = prio_to_wmult[prio];
+	load->weight = scale_load(sched_prio_to_weight[prio]);
+	load->inv_weight = sched_prio_to_wmult[prio];
 }
 
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1015,7 +1024,11 @@ inline int task_curr(const struct task_struct *p)
 }
 
 /*
- * Can drop rq->lock because from sched_class::switched_from() methods drop it.
+ * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
+ * use the balance_callback list if you want balancing.
+ *
+ * this means any call to check_class_changed() must be followed by a call to
+ * balance_callback().
  */
 static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 				       const struct sched_class *prev_class,
@@ -1024,7 +1037,7 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 	if (prev_class != p->sched_class) {
 		if (prev_class->switched_from)
 			prev_class->switched_from(rq, p);
-		/* Possble rq->lock 'hole'.  */
+
 		p->sched_class->switched_to(rq, p);
 	} else if (oldprio != p->prio || dl_task(p))
 		p->sched_class->prio_changed(rq, p, oldprio);
@@ -1638,6 +1651,8 @@ static inline
 int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags,
 		   int sibling_count_hint)
 {
+	lockdep_assert_held(&p->pi_lock);
+
 	if (p->nr_cpus_allowed > 1)
 		cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags,
 						     sibling_count_hint);
@@ -2016,7 +2031,13 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
 	while (p->on_cpu)
 		cpu_relax();
 	/*
-	 * Pairs with the smp_wmb() in finish_lock_switch().
+	 * Combined with the control dependency above, we have an effective
+	 * smp_load_acquire() without the need for full barriers.
+	 *
+	 * Pairs with the smp_store_release() in finish_lock_switch().
+	 *
+	 * This ensures that tasks getting woken will be fully ordered against
+	 * their previous state and preserve Program Order.
 	 */
 	smp_rmb();
 
@@ -2117,29 +2138,9 @@ out:
  */
 int wake_up_process(struct task_struct *p)
 {
-	return try_to_wake_up(p, TASK_NORMAL, 0);
-}
-EXPORT_SYMBOL(wake_up_process);
-
-/**
- * wake_up_process_no_notif - Wake up a specific process without notifying
- * governor
- * @p: The process to be woken up.
- *
- * Attempt to wake up the nominated process and move it to the set of runnable
- * processes.
- *
- * Return: 1 if the process was woken up, 0 if it was already running.
- *
- * It may be assumed that this function implies a write memory barrier before
- * changing the task state if and only if any tasks are woken up.
- */
-int wake_up_process_no_notif(struct task_struct *p)
-{
-	WARN_ON(task_is_stopped_or_traced(p));
 	return try_to_wake_up(p, TASK_NORMAL, 0, 1);
 }
-EXPORT_SYMBOL(wake_up_process_no_notif);
+EXPORT_SYMBOL(wake_up_process);
 
 int wake_up_state(struct task_struct *p, unsigned int state)
 {
@@ -2487,7 +2488,7 @@ void wake_up_new_task(struct task_struct *p)
 	 * Use __set_task_cpu() to avoid calling sched_class::migrate_task_rq,
 	 * as we're not fully set-up yet.
 	 */
-	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0, 1));
 #endif
 	rq = __task_rq_lock(p);
 	update_rq_clock(rq);
@@ -2616,7 +2617,6 @@ static inline void
 prepare_task_switch(struct rq *rq, struct task_struct *prev,
 		    struct task_struct *next)
 {
-	trace_sched_switch(prev, next);
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
 	fire_sched_out_preempt_notifiers(prev, next);
@@ -2712,23 +2712,35 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 #ifdef CONFIG_SMP
 
 /* rq->lock is NOT held, but preemption is disabled */
-static inline void post_schedule(struct rq *rq)
+static void __balance_callback(struct rq *rq)
 {
-	if (rq->post_schedule) {
-		unsigned long flags;
+	struct callback_head *head, *next;
+	void (*func)(struct rq *rq);
+	unsigned long flags;
 
-		raw_spin_lock_irqsave(&rq->lock, flags);
-		if (rq->curr->sched_class->post_schedule)
-			rq->curr->sched_class->post_schedule(rq);
-		raw_spin_unlock_irqrestore(&rq->lock, flags);
+	raw_spin_lock_irqsave(&rq->lock, flags);
+	head = rq->balance_callback;
+	rq->balance_callback = NULL;
+	while (head) {
+		func = (void (*)(struct rq *))head->func;
+		next = head->next;
+		head->next = NULL;
+		head = next;
 
-		rq->post_schedule = 0;
+		func(rq);
 	}
+	raw_spin_unlock_irqrestore(&rq->lock, flags);
+}
+
+static inline void balance_callback(struct rq *rq)
+{
+	if (unlikely(rq->balance_callback))
+		__balance_callback(rq);
 }
 
 #else
 
-static inline void post_schedule(struct rq *rq)
+static inline void balance_callback(struct rq *rq)
 {
 }
 
@@ -2753,7 +2765,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	 */
 
 	rq = finish_task_switch(prev);
-	post_schedule(rq);
+	balance_callback(rq);
 	preempt_enable();
 
 	if (current->set_child_tid)
@@ -2797,6 +2809,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 * of the scheduler it's an obvious special-case), so we
 	 * do an early lockdep release here:
 	 */
+	lockdep_unpin_lock(&rq->lock);
 	spin_release(&rq->lock.dep_map, 1, _THIS_IP_);
 
 	context_tracking_task_switch(prev, next);
@@ -2868,6 +2881,36 @@ unsigned long nr_iowait_cpu(int cpu)
 	struct rq *this = cpu_rq(cpu);
 	return atomic_read(&this->nr_iowait);
 }
+
+#ifdef CONFIG_CPU_QUIET
+u64 nr_running_integral(unsigned int cpu)
+{
+	unsigned int seqcnt;
+	u64 integral;
+	struct rq *q;
+
+	if (cpu >= nr_cpu_ids)
+		return 0;
+
+	q = cpu_rq(cpu);
+
+	/*
+	 * Update average to avoid reading stalled value if there were
+	 * no run-queue changes for a long time. On the other hand if
+	 * the changes are happening right now, just read current value
+	 * directly.
+	 */
+
+	seqcnt = read_seqcount_begin(&q->ave_seqcnt);
+	integral = do_nr_running_integral(q);
+	if (read_seqcount_retry(&q->ave_seqcnt, seqcnt)) {
+		read_seqcount_begin(&q->ave_seqcnt);
+		integral = q->nr_running_integral;
+	}
+
+	return integral;
+}
+#endif
 
 void get_iowait_load(unsigned long *nr_waiters, unsigned long *load)
 {
@@ -3205,8 +3248,10 @@ static inline void schedule_debug(struct task_struct *prev)
 		panic("corrupted stack end detected inside scheduler\n");
 #endif
 
-	if (unlikely(in_atomic_preempt_off()))
+	if (unlikely(in_atomic_preempt_off())) {
 		__schedule_bug(prev);
+		preempt_count_set(PREEMPT_DISABLED);
+	}
 	rcu_sleep_check();
 
 	profile_hit(SCHED_PROFILING, __builtin_return_address(0));
@@ -3376,12 +3421,15 @@ static void __sched notrace __schedule(bool preempt)
 		rq->curr = next;
 		++*switch_count;
 
+		//trace_sched_switch(preempt, prev, next);
 		rq = context_switch(rq, prev, next); /* unlocks the rq */
 		cpu = cpu_of(rq);
-	} else
+	} else {
+		lockdep_unpin_lock(&rq->lock);
 		raw_spin_unlock_irq(&rq->lock);
+	}
 
-	post_schedule(rq);
+	balance_callback(rq);
 }
 
 static inline void sched_submit_work(struct task_struct *tsk)
@@ -3639,7 +3687,11 @@ void rt_mutex_setprio(struct task_struct *p, int prio)
 
 	check_class_changed(rq, p, prev_class, oldprio);
 out_unlock:
+	preempt_disable(); /* avoid rq from going away on us */
 	__task_rq_unlock(rq);
+
+	balance_callback(rq);
+	preempt_enable();
 }
 #endif
 
@@ -3979,7 +4031,7 @@ static bool dl_param_changed(struct task_struct *p,
 
 static int __sched_setscheduler(struct task_struct *p,
 				const struct sched_attr *attr,
-				bool user)
+				bool user, bool pi)
 {
 	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 :
 		      MAX_RT_PRIO - 1 - attr->sched_priority;
@@ -4163,18 +4215,20 @@ change:
 	p->sched_reset_on_fork = reset_on_fork;
 	oldprio = p->prio;
 
-	/*
-	 * Take priority boosted tasks into account. If the new
-	 * effective priority is unchanged, we just store the new
-	 * normal parameters and do not touch the scheduler class and
-	 * the runqueue. This will be done when the task deboost
-	 * itself.
-	 */
-	new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
-	if (new_effective_prio == oldprio) {
-		__setscheduler_params(p, attr);
-		task_rq_unlock(rq, p, &flags);
-		return 0;
+	if (pi) {
+		/*
+		 * Take priority boosted tasks into account. If the new
+		 * effective priority is unchanged, we just store the new
+		 * normal parameters and do not touch the scheduler class and
+		 * the runqueue. This will be done when the task deboost
+		 * itself.
+		 */
+		new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
+		if (new_effective_prio == oldprio) {
+			__setscheduler_params(p, attr);
+			task_rq_unlock(rq, p, &flags);
+			return 0;
+		}
 	}
 
 	queued = task_on_rq_queued(p);
@@ -4185,7 +4239,7 @@ change:
 		put_prev_task(rq, p);
 
 	prev_class = p->sched_class;
-	__setscheduler(rq, p, attr, true);
+	__setscheduler(rq, p, attr, pi);
 
 	if (running)
 		p->sched_class->set_curr_task(rq);
@@ -4202,9 +4256,17 @@ change:
 	}
 
 	check_class_changed(rq, p, prev_class, oldprio);
+	preempt_disable(); /* avoid rq from going away on us */
 	task_rq_unlock(rq, p, &flags);
 
-	rt_mutex_adjust_pi(p);
+	if (pi)
+		rt_mutex_adjust_pi(p);
+
+	/*
+	 * Run balance callbacks after we've adjusted the PI chain.
+	 */
+	balance_callback(rq);
+	preempt_enable();
 
 	return 0;
 }
@@ -4225,7 +4287,7 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		attr.sched_policy = policy;
 	}
 
-	return __sched_setscheduler(p, &attr, check);
+	return __sched_setscheduler(p, &attr, check, true);
 }
 /**
  * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
@@ -4246,7 +4308,7 @@ EXPORT_SYMBOL_GPL(sched_setscheduler);
 
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
-	return __sched_setscheduler(p, attr, true);
+	return __sched_setscheduler(p, attr, true, true);
 }
 EXPORT_SYMBOL_GPL(sched_setattr);
 
@@ -7743,6 +7805,7 @@ void __init sched_init(void)
 	INIT_LIST_HEAD(&root_task_group.children);
 	INIT_LIST_HEAD(&root_task_group.siblings);
 	autogroup_init(&init_task);
+
 #endif /* CONFIG_CGROUP_SCHED */
 
 	for_each_possible_cpu(i) {
@@ -7797,7 +7860,7 @@ void __init sched_init(void)
 		rq->sd = NULL;
 		rq->rd = NULL;
 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
-		rq->post_schedule = 0;
+		rq->balance_callback = NULL;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;
 		rq->push_cpu = 0;
@@ -7908,11 +7971,11 @@ void ___might_sleep(const char *file, int line, int preempt_offset)
 
 	rcu_sleep_check(); /* WARN_ON_ONCE() by default, no rate limit reqd. */
 	if ((preempt_count_equals(preempt_offset) && !irqs_disabled() &&
-	     !is_idle_task(current)) || oops_in_progress)
+	     !is_idle_task(current)) ||
+	    system_state == SYSTEM_BOOTING || system_state > SYSTEM_RUNNING ||
+	    oops_in_progress)
 		return;
-	if (system_state != SYSTEM_RUNNING &&
-	    (!__might_sleep_init_called || system_state != SYSTEM_BOOTING))
-		return;
+
 	if (time_before(jiffies, prev_jiffy + HZ) && prev_jiffy)
 		return;
 	prev_jiffy = jiffies;
@@ -7944,32 +8007,12 @@ EXPORT_SYMBOL(___might_sleep);
 #endif
 
 #ifdef CONFIG_MAGIC_SYSRQ
-static void normalize_task(struct rq *rq, struct task_struct *p)
-{
-	const struct sched_class *prev_class = p->sched_class;
-	struct sched_attr attr = {
-		.sched_policy = SCHED_NORMAL,
-	};
-	int old_prio = p->prio;
-	int queued;
-
-	queued = task_on_rq_queued(p);
-	if (queued)
-		dequeue_task(rq, p, 0);
-	__setscheduler(rq, p, &attr, false);
-	if (queued) {
-		enqueue_task(rq, p, 0);
-		resched_curr(rq);
-	}
-
-	check_class_changed(rq, p, prev_class, old_prio);
-}
-
 void normalize_rt_tasks(void)
 {
 	struct task_struct *g, *p;
-	unsigned long flags;
-	struct rq *rq;
+	struct sched_attr attr = {
+		.sched_policy = SCHED_NORMAL,
+	};
 
 	read_lock(&tasklist_lock);
 	for_each_process_thread(g, p) {
@@ -7996,9 +8039,7 @@ void normalize_rt_tasks(void)
 			continue;
 		}
 
-		rq = task_rq_lock(p, &flags);
-		normalize_task(rq, p);
-		task_rq_unlock(rq, p, &flags);
+		__sched_setscheduler(p, &attr, false, false);
 	}
 	read_unlock(&tasklist_lock);
 }
@@ -9029,3 +9070,44 @@ void dump_cpu_task(int cpu)
 	pr_info("Task dump for CPU %d:\n", cpu);
 	sched_show_task(cpu_curr(cpu));
 }
+
+/*
+ * Nice levels are multiplicative, with a gentle 10% change for every
+ * nice level changed. I.e. when a CPU-bound task goes from nice 0 to
+ * nice 1, it will get ~10% less CPU time than another CPU-bound task
+ * that remained on nice 0.
+ *
+ * The "10% effect" is relative and cumulative: from _any_ nice level,
+ * if you go up 1 level, it's -10% CPU usage, if you go down 1 level
+ * it's +10% CPU usage. (to achieve that we use a multiplier of 1.25.
+ * If a task goes up by ~10% and another task goes down by ~10% then
+ * the relative distance between them is ~25%.)
+ */
+const int sched_prio_to_weight[40] = {
+ /* -20 */     88761,     71755,     56483,     46273,     36291,
+ /* -15 */     29154,     23254,     18705,     14949,     11916,
+ /* -10 */      9548,      7620,      6100,      4904,      3906,
+ /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ /*   0 */      1024,       820,       655,       526,       423,
+ /*   5 */       335,       272,       215,       172,       137,
+ /*  10 */       110,        87,        70,        56,        45,
+ /*  15 */        36,        29,        23,        18,        15,
+};
+
+/*
+ * Inverse (2^32/x) values of the sched_prio_to_weight[] array, precalculated.
+ *
+ * In cases where the weight does not change often, we can use the
+ * precalculated inverse to speed up arithmetics by turning divisions
+ * into multiplications:
+ */
+const u32 sched_prio_to_wmult[40] = {
+ /* -20 */     48388,     59856,     76040,     92818,    118348,
+ /* -15 */    147320,    184698,    229616,    287308,    360437,
+ /* -10 */    449829,    563644,    704093,    875809,   1099582,
+ /*  -5 */   1376151,   1717300,   2157191,   2708050,   3363326,
+ /*   0 */   4194304,   5237765,   6557202,   8165337,  10153587,
+ /*   5 */  12820798,  15790321,  19976592,  24970740,  31350126,
+ /*  10 */  39045157,  49367440,  61356676,  76695844,  95443717,
+ /*  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+};

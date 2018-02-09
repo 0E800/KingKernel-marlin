@@ -998,6 +998,7 @@ struct wake_q_node {
 struct wake_q_head {
 	struct wake_q_node *first;
 	struct wake_q_node **lastp;
+	int count;
 };
 
 #define WAKE_Q_TAIL ((struct wake_q_node *) 0x01)
@@ -1426,8 +1427,13 @@ struct sched_entity {
 #endif
 
 #ifdef CONFIG_SMP
-	/* Per entity load average tracking */
-	struct sched_avg	avg;
+	/*
+	 * Per entity load average tracking.
+	 *
+	 * Put into separate cache line so it does not
+	 * collide with read-mostly values above.
+	 */
+	struct sched_avg	avg ____cacheline_aligned_in_smp;
 #endif
 };
 
@@ -1436,8 +1442,10 @@ struct sched_rt_entity {
 	unsigned long timeout;
 	unsigned long watchdog_stamp;
 	unsigned int time_slice;
-	unsigned short on_rq;
-	unsigned short on_list;
+
+	/* Accesses for these must be guarded by rq->lock of the task's rq */
+	bool schedtune_enqueued;
+	struct hrtimer schedtune_timer;
 
 	struct sched_rt_entity *back;
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1637,6 +1645,8 @@ struct task_struct {
 #endif
 
 	unsigned long atomic_flags; /* Flags needing atomic access. */
+
+	struct restart_block restart_block;
 
 	pid_t pid;
 	pid_t tgid;

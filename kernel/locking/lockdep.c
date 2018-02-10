@@ -45,6 +45,7 @@
 #include <linux/bitops.h>
 #include <linux/gfp.h>
 #include <linux/kmemcheck.h>
+#include <linux/random.h>
 
 #include <asm/sections.h>
 
@@ -3489,32 +3490,53 @@ static int lock_release_nested(struct task_struct *curr,
 	return 1;
 }
 
-/*
- * Remove the lock to the list of currently held locks - this gets
- * called on mutex_unlock()/spin_unlock*() (or on a failed
- * mutex_lock_interruptible()). This is done for unlocks that nest
- * perfectly. (i.e. the current top of the lock-stack is unlocked)
- */
-static void
-__lock_release(struct lockdep_map *lock, int nested, unsigned long ip)
+static struct pin_cookie __lock_pin_lock(struct lockdep_map *lock)
+{
+	struct pin_cookie cookie = NIL_COOKIE;
+	struct task_struct *curr = current;
+	int i;
+
+	if (unlikely(!debug_locks))
+		return cookie;
+
+	for (i = 0; i < curr->lockdep_depth; i++) {
+		struct held_lock *hlock = curr->held_locks + i;
+
+		if (match_held_lock(hlock, lock)) {
+			/*
+			 * Grab 16bits of randomness; this is sufficient to not
+			 * be guessable and still allows some pin nesting in
+			 * our u32 pin_count.
+			 */
+			cookie.val = 1 + (prandom_u32() >> 16);
+			hlock->pin_count += cookie.val;
+			return cookie;
+		}
+	}
+
+	WARN(1, "pinning an unheld lock\n");
+	return cookie;
+}
+
+static void __lock_repin_lock(struct lockdep_map *lock, struct pin_cookie cookie)
 {
 	struct task_struct *curr = current;
 
 	if (!check_unlock(curr, lock, ip))
 		return;
 
-	if (nested) {
-		if (!lock_release_nested(curr, lock, ip))
-			return;
-	} else {
-		if (!lock_release_non_nested(curr, lock, ip))
+	for (i = 0; i < curr->lockdep_depth; i++) {
+		struct held_lock *hlock = curr->held_locks + i;
+
+		if (match_held_lock(hlock, lock)) {
+			hlock->pin_count += cookie.val;
 			return;
 	}
 
 	check_chain_key(curr);
 }
 
-static int __lock_is_held(struct lockdep_map *lock)
+static void __lock_unpin_lock(struct lockdep_map *lock, struct pin_cookie cookie)
 {
 	struct task_struct *curr = current;
 	int i;
@@ -3522,8 +3544,17 @@ static int __lock_is_held(struct lockdep_map *lock)
 	for (i = 0; i < curr->lockdep_depth; i++) {
 		struct held_lock *hlock = curr->held_locks + i;
 
-		if (match_held_lock(hlock, lock))
-			return 1;
+		if (match_held_lock(hlock, lock)) {
+			if (WARN(!hlock->pin_count, "unpinning an unpinned lock\n"))
+				return;
+
+			hlock->pin_count -= cookie.val;
+
+			if (WARN((int)hlock->pin_count < 0, "pin count corrupted\n"))
+				hlock->pin_count = 0;
+
+			return;
+		}
 	}
 
 	return 0;
@@ -3650,6 +3681,60 @@ int lock_is_held(struct lockdep_map *lock)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(lock_is_held);
+
+struct pin_cookie lock_pin_lock(struct lockdep_map *lock)
+{
+	struct pin_cookie cookie = NIL_COOKIE;
+	unsigned long flags;
+
+	if (unlikely(current->lockdep_recursion))
+		return cookie;
+
+	raw_local_irq_save(flags);
+	check_flags(flags);
+
+	current->lockdep_recursion = 1;
+	cookie = __lock_pin_lock(lock);
+	current->lockdep_recursion = 0;
+	raw_local_irq_restore(flags);
+
+	return cookie;
+}
+EXPORT_SYMBOL_GPL(lock_pin_lock);
+
+void lock_repin_lock(struct lockdep_map *lock, struct pin_cookie cookie)
+{
+	unsigned long flags;
+
+	if (unlikely(current->lockdep_recursion))
+		return;
+
+	raw_local_irq_save(flags);
+	check_flags(flags);
+
+	current->lockdep_recursion = 1;
+	__lock_repin_lock(lock, cookie);
+	current->lockdep_recursion = 0;
+	raw_local_irq_restore(flags);
+}
+EXPORT_SYMBOL_GPL(lock_repin_lock);
+
+void lock_unpin_lock(struct lockdep_map *lock, struct pin_cookie cookie)
+{
+	unsigned long flags;
+
+	if (unlikely(current->lockdep_recursion))
+		return;
+
+	raw_local_irq_save(flags);
+	check_flags(flags);
+
+	current->lockdep_recursion = 1;
+	__lock_unpin_lock(lock, cookie);
+	current->lockdep_recursion = 0;
+	raw_local_irq_restore(flags);
+}
+EXPORT_SYMBOL_GPL(lock_unpin_lock);
 
 void lockdep_set_current_reclaim_state(gfp_t gfp_mask)
 {

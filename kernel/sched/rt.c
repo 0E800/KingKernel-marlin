@@ -8,7 +8,6 @@
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/irq_work.h>
-#include <linux/hrtimer.h>
 
 #include "walt.h"
 #include "tune.h" 
@@ -1352,7 +1351,8 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	if (!task_current(rq, p) && p->nr_cpus_allowed > 1)
 		enqueue_pushable_task(rq, p);
 
-	*per_cpu_ptr(&incoming_rt_task, cpu_of(rq)) = false;
+	schedtune_enqueue_task(p, cpu_of(rq));
+	sched_rt_update_capacity_req(rq);
 }
 
 static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
@@ -1368,6 +1368,9 @@ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	walt_dec_cumulative_runnable_avg(rq, p);
 
 	dequeue_pushable_task(rq, p);
+
+	schedtune_dequeue_task(p, cpu_of(rq));
+	sched_rt_update_capacity_req(rq);
 }
 
 /*
@@ -1471,8 +1474,8 @@ task_may_not_preempt(struct task_struct *task, int cpu)
 		return true;
 
 	return ((softirqs & LONG_SOFTIRQ_MASK) &&
-		(task == cpu_ksoftirqd || is_idle_task(task) ||
-		 (task_pc & (HARDIRQ_MASK | SOFTIRQ_MASK))));
+		(task == cpu_ksoftirqd ||
+		 task_pc & SOFTIRQ_MASK));
 }
 
 static int
@@ -1497,25 +1500,6 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags,
 	may_not_preempt = task_may_not_preempt(curr, cpu);
 	target = find_lowest_rq(p, sync);
 
-	/*
-	 * Check once for losing a race with the other core's irq handler.
-	 * This does not happen frequently, but it can avoid delaying
-	 * the execution of the RT task in those cases.
-	 */
-	if (target != -1) {
-		tgt_task = READ_ONCE(cpu_rq(target)->curr);
-		if (task_may_not_preempt(tgt_task, target))
-			target = find_lowest_rq(p, sync);
-	}
-	/*
-	 * Possible race. Don't bother moving it if the
-	 * destination CPU is not running a lower priority task.
-	 */
-	if (target != -1 &&
-	    (may_not_preempt || p->prio < cpu_rq(target)->rt.highest_prio.curr))
-		cpu = target;
-	*per_cpu_ptr(&incoming_rt_task, cpu) = true;
-	rcu_read_unlock();
 out:
 	return cpu;
 }

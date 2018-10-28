@@ -16,15 +16,17 @@
 #include <linux/cpu.h>
 
 #include "zcomp.h"
-#include "zcomp_lzo.h"
-#ifdef CONFIG_ZRAM_LZ4_COMPRESS
-#include "zcomp_lz4.h"
-#endif
+
 
 static struct zcomp_backend *backends[] = {
-	&zcomp_lzo,
-#ifdef CONFIG_ZRAM_LZ4_COMPRESS
-	&zcomp_lz4,
+#ifndef CONFIG_ZRAM_HIDE_LZO
+	"lzo",
+#endif
+#if IS_ENABLED(CONFIG_CRYPTO_LZ4)
+	"lz4",
+#endif
+#if IS_ENABLED(CONFIG_CRYPTO_LZ4HC)
+	"lz4hc",
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
 	"zstd",

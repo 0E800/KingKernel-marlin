@@ -606,7 +606,6 @@ struct task_cputime_atomic {
 	}
 
 #define PREEMPT_DISABLED	(PREEMPT_DISABLE_OFFSET + PREEMPT_ENABLED)
->>>>>>> b7f4eb07ff4... sched/core: Create preempt_count invariant
 
 /*
  * Disable preemption until the scheduler is running.

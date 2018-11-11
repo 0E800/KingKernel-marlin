@@ -298,7 +298,6 @@ static int sdev_runtime_resume(struct device *dev)
 	return err;
 }
 
-
 static int scsi_runtime_resume(struct device *dev)
 {
 	int err = 0;

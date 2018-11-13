@@ -23,6 +23,8 @@
 /* Max limits for throttle policy */
 #define THROTL_IOPS_MAX		UINT_MAX
 
+#define CFQ_WEIGHT_DEFAULT	500
+
 #ifdef CONFIG_BLK_CGROUP
 
 enum blkg_rwstat_type {
